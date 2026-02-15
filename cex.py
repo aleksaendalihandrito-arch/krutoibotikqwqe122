@@ -1,414 +1,412 @@
 import requests
 import time
-import os  # Добавлено для получения переменных окружения
-from datetime import datetime, date
-import urllib.parse
+from datetime import datetime
 import threading
-import atexit
-import sys  # Добавлено для логирования
+import logging
+from typing import Optional, Dict, Any
 
-# Настройки - ТОКЕН БЕРИТЕ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ!
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '7446722367:AAFfl-bNGvYiU6_GpNsFeRmo2ZNZMJRx47I')
-# На Render лучше установить токен как переменную окружения для безопасности
+# Настройки
+TELEGRAM_BOT_TOKEN = '8526007602:AAF2p-ngC0amxeo1UvPOOy8RqHVxW0dYGAg'  # Замените на свой токен
+TELEGRAM_CHAT_ID = '5296533274'  # ID чата/пользователя
 
-PRICE_INCREASE_THRESHOLD = 1.5
-PRICE_DECREASE_THRESHOLD = -50
-TIME_WINDOW = 60 * 5
-MAX_ALERTS_PER_DAY = 3
+# Параметры арбитража
+MIN_SPREAD_PERCENT = 1.5  # Минимальный спред для сигнала
+MIN_VOLUME_USD = 100000  # Минимальный объем на DEX (в USD) для фильтрации
+CHECK_INTERVAL = 30  # ИНТЕРВАЛ ТЕПЕРЬ 30 СЕКУНД
+MEXC_VOLUME_MULTIPLIER = 0.5  # DEX объем должен быть > MEXC объем * множитель
 
-# Настройки запросов
-REQUEST_TIMEOUT = 10
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+# НАСТРОЙКА КОЛИЧЕСТВА ПРОВЕРОК
+SYMBOLS_PER_CYCLE = 400  # Сколько монет проверять за один цикл (было 50, стало 200)
 
-# База данных пользователей (в памяти)
-users = {
-    '5296533274': {
-        'active': True,
-        'daily_alerts': {
-            'date': date.today(),
-            'counts': {}
-        }
-    }
-}
+# Список сетей для DexScreener (приоритетные)
+PREFERRED_CHAINS = ['ethereum', 'bsc', 'polygon', 'arbitrum', 'optimism', 'avalanche', 'base', 'fantom']
 
-historical_data = {}
+# Кэш для статусов монет MEXC (чтобы не ддосить)
+coin_status_cache = {}
+CACHE_TTL = 300  # 5 минут
 
-# Функция для принудительного вывода логов (для Render)
-def log_message(msg):
-    print(msg, flush=True)
-    sys.stdout.flush()
+# Логирование - ОСТАВЛЯЕМ INFO, DEBUG включать не обязательно
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def make_request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES):
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-            if response.status_code == 200:
-                return response
-            else:
-                log_message(f"Попытка {attempt + 1}: Ошибка HTTP {response.status_code} для {url}")
-        except requests.exceptions.Timeout:
-            log_message(f"Попытка {attempt + 1}: Таймаут подключения к {url}")
-        except requests.exceptions.ConnectionError as e:
-            log_message(f"Попытка {attempt + 1}: Ошибка подключения к {url}: {e}")
-        except Exception as e:
-            log_message(f"Попытка {attempt + 1}: Неожиданная ошибка для {url}: {e}")
+# Хранилище отправленных сигналов (чтобы не спамить одним и тем же)
+sent_signals = {}
 
-        if attempt < max_retries - 1:
-            time.sleep(RETRY_DELAY * (attempt + 1))
 
-    return None
-
-def generate_links(symbol):
-    clean_symbol = symbol.replace('USDT', '').replace('1000', '')
-    return {
-        'coinglass': f"https://www.coinglass.com/pro/futures/LiquidationHeatMapModel3?coin={clean_symbol}&type=pair",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
-        'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
-        'binance': f"https://www.binance.com/ru/trade/{symbol}",
-        'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
-    }
-
-def reset_daily_counters(chat_id):
-    today = date.today()
-    if users[chat_id]['daily_alerts']['date'] != today:
-        users[chat_id]['daily_alerts']['date'] = today
-        users[chat_id]['daily_alerts']['counts'] = {}
-        log_message(f"Счетчики уведомлений сброшены для пользователя {chat_id}")
-
-def can_send_alert(chat_id, symbol):
-    if chat_id not in users or not users[chat_id]['active']:
-        return False
-
-    reset_daily_counters(chat_id)
-    count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-    if count >= MAX_ALERTS_PER_DAY:
-        return False
-    users[chat_id]['daily_alerts']['counts'][symbol] = count + 1
-    return True
-
-def send_telegram_notification(chat_id, message, symbol, exchange):
-    if not can_send_alert(chat_id, symbol):
-        log_message(f"Лимит уведомлений достигнут для {symbol} ({exchange}) у пользователя {chat_id}")
-        return False
-
-    monospace_symbol = f"<code>{symbol}</code>"
-    links = generate_links(symbol)
-    message_with_links = (
-        f"{message}\n\n"
-        f"🔗 <b>Быстрый анализ:</b>\n"
-        f"• 📊 <a href='{links['coinglass']}'>Coinglass</a>\n"
-        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
-        f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
-        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
-    )
-
-    message_with_links = message_with_links.replace(symbol, monospace_symbol)
-
+def send_telegram_message(text: str) -> bool:
+    """Отправка сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        'chat_id': chat_id,
-        'text': message_with_links,
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': text,
         'parse_mode': 'HTML',
         'disable_web_page_preview': False
     }
     try:
-        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         return True
     except Exception as e:
-        log_message(f"Ошибка отправки пользователю {chat_id}: {repr(e)}")
+        logging.error(f"Ошибка отправки Telegram: {e}")
         return False
 
-def calculate_change(old, new):
-    if old == 0:
-        return 0.0
-    return ((new - old) / old) * 100
 
-def fetch_binance_symbols():
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-    response = make_request_with_retry(url, timeout=15)
-    if response:
-        try:
-            data = response.json()
-            symbols = []
-            for symbol_info in data['symbols']:
-                if symbol_info['quoteAsset'] == 'USDT' and symbol_info['status'] == 'TRADING':
-                    symbols.append(symbol_info['symbol'])
-            log_message(f"Binance: получено {len(symbols)} символов")
-            return symbols[:100]  # Ограничиваем для тестирования
-        except Exception as e:
-            log_message(f"Ошибка парсинга данных Binance: {e}")
-    else:
-        log_message("Не удалось получить символы с Binance после всех попыток")
-    return []
+def get_all_mexc_usdt_symbols() -> list:
+    """Получение всех USDT пар с MEXC через публичный тикер"""
+    url = "https://api.mexc.com/api/v3/ticker/24hr"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
-def fetch_bybit_symbols():
-    url = "https://api.bybit.com/v5/market/instruments-info"
-    params = {"category": "linear"}
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            if data['retCode'] == 0:
-                symbols = [item['symbol'] for item in data['result']['list']]
-                log_message(f"Bybit: получено {len(symbols)} символов")
-                return symbols[:100]  # Ограничиваем для тестирования
-        except Exception as e:
-            log_message(f"Ошибка парсинга данных Bybit: {e}")
-    else:
-        log_message("Не удалось получить символы с Bybit после всех попыток")
-    return []
+        symbols = []
+        for item in data:
+            symbol = item.get('symbol', '')
+            if symbol.endswith('USDT'):
+                # Проверяем, что есть объем и цена
+                if float(item.get('quoteVolume', 0)) > 0 and float(item.get('lastPrice', 0)) > 0:
+                    symbols.append(symbol)
 
-def fetch_binance_ticker(symbol):
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    params = {"symbol": symbol}
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            if 'code' in data and data['code'] == -1121:
+        logging.info(f"✅ Загружено {len(symbols)} USDT пар с MEXC")
+        return symbols
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки символов MEXC: {e}")
+        return []
+
+
+def get_mexc_ticker(symbol: str) -> Optional[Dict[str, Any]]:
+    """Получение 24-часового тикера с MEXC для конкретной пары"""
+    url = "https://api.mexc.com/api/v3/ticker/24hr"
+    params = {'symbol': symbol}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Проверяем, что это не массив (если запросили конкретный символ)
+        if isinstance(data, list):
+            if len(data) > 0:
+                data = data[0]
+            else:
                 return None
-            return {
-                'symbol': data['symbol'],
-                'lastPrice': float(data['lastPrice']),
-                'priceChangePercent': float(data['priceChangePercent'])
-            }
-        except Exception as e:
-            log_message(f"Ошибка парсинга тикера {symbol} с Binance: {e}")
-    return None
 
-def fetch_bybit_ticker(symbol):
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear", "symbol": symbol}
-    response = make_request_with_retry(url, params)
-    if response:
-        try:
-            data = response.json()
-            if data['retCode'] == 0 and data['result']['list']:
-                ticker = data['result']['list'][0]
-                return {
-                    'symbol': ticker['symbol'],
-                    'lastPrice': float(ticker['lastPrice']),
-                    'priceChangePercent': float(ticker['price24hPcnt']) * 100
-                }
-        except Exception as e:
-            log_message(f"Ошибка парсинга тикера {symbol} с Bybit: {e}")
-    return None
-
-def add_user(chat_id):
-    if chat_id not in users:
-        users[chat_id] = {
-            'active': True,
-            'daily_alerts': {
-                'date': date.today(),
-                'counts': {}
-            }
+        return {
+            'symbol': data['symbol'],
+            'lastPrice': float(data['lastPrice']),
+            'volume': float(data['quoteVolume']),  # объем в USDT за 24ч
+            'priceChangePercent': float(data['priceChangePercent'])
         }
-        log_message(f"Добавлен новый пользователь: {chat_id}")
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': chat_id,
-            'text': "✅ Вы успешно подписались на уведомления о торговых сигналах!",
-            'parse_mode': 'HTML'
+    except Exception as e:
+        logging.debug(f"Ошибка получения тикера MEXC для {symbol}: {e}")
+        return None
+
+
+def get_coin_status(currency: str) -> Optional[Dict[str, Any]]:
+    """
+    Получение статуса депозита/вывода монеты с MEXC через публичный API
+    Использует кэширование
+    """
+    # Проверяем кэш
+    now = time.time()
+    if currency in coin_status_cache:
+        cached_data, timestamp = coin_status_cache[currency]
+        if now - timestamp < CACHE_TTL:
+            return cached_data
+
+    url = "https://www.mexc.com/api/platform/asset/currencyDetail"
+    params = {'currency': currency.upper()}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get('code') != 200:
+            logging.debug(f"MEXC currencyDetail {currency} ошибка: {data}")
+            return None
+
+        # Извлекаем нужные поля
+        result = {
+            'currency': currency.upper(),
+            'depositStatus': data['data'].get('depositStatus', False),
+            'withdrawStatus': data['data'].get('withdrawStatus', False),
+            'name': data['data'].get('currencyFullName', currency)
         }
-        try:
-            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            log_message(f"Ошибка отправки приветствия: {e}")
-        return True
-    return False
 
-def remove_user(chat_id):
-    if chat_id in users:
-        del users[chat_id]
-        log_message(f"Пользователь {chat_id} удален")
-        return True
-    return False
+        # Сохраняем в кэш
+        coin_status_cache[currency] = (result, now)
+        return result
+    except Exception as e:
+        logging.debug(f"Ошибка получения статуса для {currency}: {e}")
+        return None
 
-def broadcast_message(message):
-    for chat_id in list(users.keys()):
-        if users[chat_id]['active']:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            try:
-                requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            except Exception as e:
-                log_message(f"Ошибка отправки сообщения пользователю {chat_id}: {e}")
 
-def send_shutdown_message():
-    shutdown_msg = "🛑 <b>Бот остановлен</b>\n\nМониторинг приостановлен. Для возобновления работы перезапустите бота."
-    broadcast_message(shutdown_msg)
-    log_message("Сообщение о выключении отправлено всем пользователям")
-
-def handle_telegram_updates():
-    last_update_id = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {'timeout': 30, 'offset': last_update_id + 1}
-            response = requests.get(url, params=params, timeout=35)
-            data = response.json()
-            if data['ok']:
-                for update in data['result']:
-                    last_update_id = update['update_id']
-                    if 'message' not in update:
-                        continue
-                    message = update['message']
-                    chat_id = str(message['chat']['id'])
-                    text = message.get('text', '').strip().lower()
-                    
-                    if text == '/start':
-                        add_user(chat_id)
-                    elif text == '/stop':
-                        remove_user(chat_id)
-                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                        payload = {
-                            'chat_id': chat_id,
-                            'text': "❌ Вы отписались от уведомлений.",
-                            'parse_mode': 'HTML'
-                        }
-                        try:
-                            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-                        except Exception as e:
-                            log_message(f"Ошибка отправки сообщения: {e}")
-                    elif text == '/help':
-                        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                        payload = {
-                            'chat_id': chat_id,
-                            'text': "🤖 <b>Команды бота:</b>\n/start - подписаться на уведомления\n/stop - отписаться от уведомлений\n/help - показать эту справку",
-                            'parse_mode': 'HTML'
-                        }
-                        try:
-                            requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-                        except Exception as e:
-                            log_message(f"Ошибка отправки справки: {e}")
-            time.sleep(1)
-        except requests.exceptions.Timeout:
-            log_message("Таймаут при опросе Telegram API (это нормально)")
-            continue
-        except Exception as e:
-            log_message(f"Ошибка обработки обновлений: {e}")
-            time.sleep(5)
-
-def monitor_exchange(exchange_name, fetch_symbols_func, fetch_ticker_func):
-    log_message(f"Запуск мониторинга {exchange_name}...")
-    symbols = fetch_symbols_func()
-    if not symbols:
-        log_message(f"Не удалось получить список символов с {exchange_name}")
-        time.sleep(30)
-        return
-
-    for symbol in symbols:
-        key = f"{exchange_name}_{symbol}"
-        if key not in historical_data:
-            historical_data[key] = {'price': []}
-
-    log_message(f"Мониторинг {exchange_name}: {len(symbols)} символов")
-    error_count = 0
-    max_errors_before_reload = 10
-
-    while True:
-        try:
-            successful_requests = 0
-            for symbol in symbols:
-                ticker_data = fetch_ticker_func(symbol)
-                if ticker_data:
-                    successful_requests += 1
-                    error_count = 0
-                    current_price = ticker_data['lastPrice']
-                    timestamp = int(datetime.now().timestamp())
-                    key = f"{exchange_name}_{symbol}"
-                    
-                    historical_data[key]['price'].append({'value': current_price, 'timestamp': timestamp})
-                    historical_data[key]['price'] = [x for x in historical_data[key]['price']
-                                                     if timestamp - x['timestamp'] <= TIME_WINDOW]
-                    
-                    if len(historical_data[key]['price']) > 1:
-                        old_price = historical_data[key]['price'][0]['value']
-                        price_change = calculate_change(old_price, current_price)
-                        
-                        if price_change >= PRICE_INCREASE_THRESHOLD:
-                            for chat_id in list(users.keys()):
-                                if users[chat_id]['active']:
-                                    alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                    msg = (f"🚨 <b>{symbol}</b> ({exchange_name})\n"
-                                           f"📈 Рост цены: +{price_change:.2f}%\n"
-                                           f"Было: {old_price:.4f}\n"
-                                           f"Стало: {current_price:.4f}\n"
-                                           f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
-                                    send_telegram_notification(chat_id, msg, symbol, exchange_name)
-                        
-                        elif price_change <= PRICE_DECREASE_THRESHOLD:
-                            for chat_id in list(users.keys()):
-                                if users[chat_id]['active']:
-                                    alert_count = users[chat_id]['daily_alerts']['counts'].get(symbol, 0)
-                                    msg = (f"🔻 <b>{symbol}</b> ({exchange_name})\n"
-                                           f"📉 Падение цены: {price_change:.2f}%\n"
-                                           f"Было: {old_price:.4f}\n"
-                                           f"Стало: {current_price:.4f}\n"
-                                           f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
-                                    send_telegram_notification(chat_id, msg, symbol, exchange_name)
-                else:
-                    error_count += 1
-                    if error_count >= max_errors_before_reload:
-                        log_message(f"Слишком много ошибок на {exchange_name}, перезагружаем список символов...")
-                        new_symbols = fetch_symbols_func()
-                        if new_symbols:
-                            symbols = new_symbols
-                            if len(symbols) > 100:
-                                symbols = symbols[:100]
-                            log_message(f"Обновлен список символов: {len(symbols)} символов")
-                        error_count = 0
-                        break
-            
-            success_rate = (successful_requests / len(symbols)) * 100 if symbols else 0
-            log_message(f"{exchange_name}: успешных запросов {successful_requests}/{len(symbols)} ({success_rate:.1f}%)")
-            time.sleep(5)
-        except Exception as e:
-            log_message(f"Критическая ошибка мониторинга {exchange_name}: {repr(e)}")
-            time.sleep(10)
-
-def main():
-    log_message("=" * 50)
-    log_message("Запуск мониторинга цен с Binance и Bybit...")
-    log_message(f"Время запуска: {datetime.now()}")
-    log_message("=" * 50)
-
-    atexit.register(send_shutdown_message)
-    update_thread = threading.Thread(target=handle_telegram_updates, daemon=True)
-    update_thread.start()
-    
-    broadcast_message(
-        "🔍 <b>Бот начал работу!</b>\n\nМониторинг цен активирован для Binance и Bybit с аналитическими ссылками!")
-    log_message("Бот успешно запущен и отправил уведомление")
-
-    binance_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Binance", fetch_binance_symbols, fetch_binance_ticker),
-        daemon=True
-    )
-
-    bybit_thread = threading.Thread(
-        target=monitor_exchange,
-        args=("Bybit", fetch_bybit_symbols, fetch_bybit_ticker),
-        daemon=True
-    )
-
-    binance_thread.start()
-    bybit_thread.start()
+def get_dexscreener_pair(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Поиск пары на DexScreener по запросу (символ).
+    Возвращает лучшую пару по ликвидности среди предпочтительных сетей.
+    """
+    url = "https://api.dexscreener.com/latest/dex/search"
+    params = {'q': query}
 
     try:
-        while True:
-            time.sleep(60)  # Увеличил паузу для экономии ресурсов
-            log_message(f"Бот работает... Активных пользователей: {len([u for u in users if users[u]['active']])}")
-    except KeyboardInterrupt:
-        log_message("\nОстановка бота...")
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get('pairs'):
+            return None
+
+        # Фильтруем пары по приоритетным сетям
+        valid_pairs = []
+        for p in data['pairs']:
+            chain = p.get('chainId')
+            if chain in PREFERRED_CHAINS:
+                try:
+                    liquidity = float(p.get('liquidity', {}).get('usd', 0))
+
+                    if liquidity >= MIN_VOLUME_USD:
+                        valid_pairs.append({
+                            'chain': chain,
+                            'dex': p.get('dexId', 'unknown'),
+                            'priceUsd': float(p.get('priceUsd', 0)),
+                            'liquidityUsd': liquidity,
+                            'volume24h': float(p.get('volume', {}).get('h24', 0)),
+                            'url': p.get('url', ''),
+                            'pairAddress': p.get('pairAddress'),
+                            'baseToken': p.get('baseToken', {}).get('symbol'),
+                            'baseAddress': p.get('baseToken', {}).get('address'),
+                            'quoteToken': p.get('quoteToken', {}).get('symbol')
+                        })
+                except (ValueError, TypeError) as e:
+                    continue
+
+        if not valid_pairs:
+            return None
+
+        # Сортируем по ликвидности (убывание) и берём лучшую
+        best_pair = max(valid_pairs, key=lambda x: x['liquidityUsd'])
+
+        return best_pair
+    except Exception as e:
+        logging.debug(f"Ошибка DexScreener для {query}: {e}")
+        return None
+
+
+def extract_base_currency(mexc_symbol: str) -> str:
+    """Извлекает базовую валюту из пары MEXC"""
+    if mexc_symbol.endswith('USDT'):
+        base = mexc_symbol[:-4]
+        # Обработка популярных префиксов
+        if base.startswith('1000'):
+            base = base[4:]
+        return base
+    return mexc_symbol
+
+
+def check_arbitrage_opportunity(mexc_symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Проверяет возможность арбитража для пары mexc_symbol.
+    Возвращает словарь с данными, если условия выполнены.
+    """
+    # 1. Получаем данные с MEXC
+    mexc_ticker = get_mexc_ticker(mexc_symbol)
+    if not mexc_ticker:
+        return None
+
+    mexc_price = mexc_ticker['lastPrice']
+    mexc_volume = mexc_ticker['volume']
+
+    # 2. Проверяем статус депозита/вывода
+    base_currency = extract_base_currency(mexc_symbol)
+    currency_status = get_coin_status(base_currency)
+    if not currency_status:
+        return None
+
+    deposit_enabled = currency_status.get('depositStatus', False)
+    withdraw_enabled = currency_status.get('withdrawStatus', False)
+
+    if not deposit_enabled or not withdraw_enabled:
+        return None
+
+    # 3. Ищем пару на DexScreener
+    dex_pair = get_dexscreener_pair(base_currency)
+    if not dex_pair:
+        return None
+
+    dex_price = dex_pair['priceUsd']
+    dex_volume = dex_pair['volume24h']
+    dex_liquidity = dex_pair['liquidityUsd']
+    dex_url = dex_pair['url']
+
+    # 4. Сравниваем объемы (DEX объем должен быть > MEXC объем * множитель)
+    if dex_volume <= mexc_volume * MEXC_VOLUME_MULTIPLIER:
+        return None
+
+    # 5. Рассчитываем спред (в %)
+    spread = (mexc_price - dex_price) / dex_price * 100
+    abs_spread = abs(spread)
+
+    if abs_spread < MIN_SPREAD_PERCENT:
+        return None
+
+    # 6. Определяем направление на основе отношения цен
+    if dex_price > mexc_price:
+        direction = "LONG (MEXC догонит DEX вверх)"
+        action = "Покупка на MEXC"
+        signal_type = "🟢 LONG"
+    else:
+        direction = "SHORT (MEXC упадет до DEX)"
+        action = "Продажа на MEXC"
+        signal_type = "🔴 SHORT"
+
+    # Формируем ссылку на MEXC
+    mexc_trade_url = f"https://www.mexc.com/exchange/{mexc_symbol}"
+
+    # Уникальный ключ для предотвращения повторов (на 24 часа)
+    today = datetime.now().strftime('%Y-%m-%d')
+    signal_key = f"{base_currency}_{today}_{abs_spread:.1f}"
+    if signal_key in sent_signals:
+        # Проверяем, не устарел ли ключ
+        if time.time() - sent_signals[signal_key] < 86400:  # 24 часа
+            return None
+
+    result = {
+        'symbol': base_currency,
+        'mexc_symbol': mexc_symbol,
+        'dex_price': dex_price,
+        'mexc_price': mexc_price,
+        'spread': spread,
+        'abs_spread': abs_spread,
+        'direction': direction,
+        'action': action,
+        'signal_type': signal_type,
+        'dex_volume': dex_volume,
+        'mexc_volume': mexc_volume,
+        'dex_liquidity': dex_liquidity,
+        'dex_url': dex_url,
+        'mexc_url': mexc_trade_url,
+        'deposit': deposit_enabled,
+        'withdraw': withdraw_enabled,
+        'signal_key': signal_key,
+        'chain': dex_pair['chain'],
+        'dex_name': dex_pair['dex']
+    }
+    return result
+
+
+def format_arbitrage_message(data: Dict[str, Any]) -> str:
+    """Форматирует сообщение для Telegram (HTML, моноширинный)"""
+    # Рассчитываем цену для копирования (округляем до разумного количества знаков)
+    if data['dex_price'] < 0.0001:
+        price_precision = 8
+    elif data['dex_price'] < 0.01:
+        price_precision = 6
+    else:
+        price_precision = 4
+
+    message = f"""
+<code>{data['signal_type']} {data['symbol']} | Спред {data['abs_spread']:.2f}%</code>
+
+<b>{data['direction']}</b>
+<b>{data['action']}</b>
+
+💰 <b>Цены (копируй):</b>
+<code>DEX:    {data['dex_price']:.{price_precision}f}</code>
+<code>MEXC:   {data['mexc_price']:.{price_precision}f}</code>
+<code>Разрыв: {data['spread']:+.2f}%</code>
+
+📊 <b>Объемы 24ч:</b>
+<code>DEX:    ${data['dex_volume']:,.0f}</code>
+<code>MEXC:   ${data['mexc_volume']:,.0f}</code>
+<code>Liq:    ${data['dex_liquidity']:,.0f}</code>
+
+🔗 <b>Ссылки:</b>
+• <a href='{data['dex_url']}'>DexScreener ({data['chain']}/{data['dex_name']})</a>
+• <a href='{data['mexc_url']}'>MEXC {data['mexc_symbol']}</a>
+
+💳 <b>MEXC:</b> <code>Депозит {'✅' if data['deposit'] else '❌'} | Вывод {'✅' if data['withdraw'] else '❌'}</code>
+"""
+    return message
+
+
+def monitor():
+    """Основной цикл мониторинга"""
+    logging.info("🚀 Запуск мониторинга арбитража DexScreener / MEXC")
+    logging.info(
+        f"⚙️ Параметры: спред {MIN_SPREAD_PERCENT}%, интервал {CHECK_INTERVAL}с, монет за цикл {SYMBOLS_PER_CYCLE}")
+
+    # Отправляем сообщение о запуске
+    send_telegram_message(
+        f"🟢 <b>Бот арбитража запущен</b>\nМониторинг DEX vs MEXC активен.\nПроверяю {SYMBOLS_PER_CYCLE} монет каждые {CHECK_INTERVAL}с")
+
+    last_symbols_load = 0
+    symbols = []
+    total_checks = 0
+    opportunities_found = 0
+    cycle_count = 0
+
+    while True:
+        try:
+            cycle_count += 1
+
+            # Обновляем список символов раз в час
+            now = time.time()
+            if now - last_symbols_load > 3600 or not symbols:
+                symbols = get_all_mexc_usdt_symbols()
+                if not symbols:
+                    logging.error("❌ Не удалось загрузить символы, жду 30 сек...")
+                    time.sleep(30)
+                    continue
+                last_symbols_load = now
+                total_checks = 0
+                opportunities_found = 0
+                logging.info(f"📋 Всего монет в базе: {len(symbols)}")
+
+            # Проверяем SYMBOLS_PER_CYCLE символов за цикл
+            symbols_to_check = symbols[:SYMBOLS_PER_CYCLE]
+
+            logging.info(f"🔄 Цикл #{cycle_count}: проверяю {len(symbols_to_check)} монет...")
+
+            for i, sym in enumerate(symbols_to_check, 1):
+                try:
+                    total_checks += 1
+                    opportunity = check_arbitrage_opportunity(sym)
+                    if opportunity:
+                        opportunities_found += 1
+                        msg = format_arbitrage_message(opportunity)
+                        if send_telegram_message(msg):
+                            sent_signals[opportunity['signal_key']] = time.time()
+                            logging.info(f"✅ СИГНАЛ #{opportunities_found}: {opportunity['symbol']} "
+                                         f"спред {opportunity['abs_spread']:.2f}% ({i}/{len(symbols_to_check)})")
+                        time.sleep(2)  # Пауза между отправками
+
+                    # Прогресс каждые 50 монет
+                    if i % 50 == 0:
+                        logging.info(f"⏳ Прогресс: {i}/{len(symbols_to_check)} монет проверено")
+
+                except Exception as e:
+                    logging.error(f"❌ Ошибка при проверке {sym}: {e}")
+                    continue
+
+            # Ротация символов: перемещаем проверенные в конец
+            if symbols:
+                symbols = symbols[SYMBOLS_PER_CYCLE:] + symbols[:SYMBOLS_PER_CYCLE]
+
+            # Статистика за цикл
+            logging.info(f"📊 Цикл #{cycle_count} завершен. "
+                         f"Проверено: {len(symbols_to_check)} монет, "
+                         f"Всего проверок: {total_checks}, "
+                         f"Найдено сигналов: {opportunities_found}")
+            logging.info(f"💤 Сплю {CHECK_INTERVAL} сек...")
+            time.sleep(CHECK_INTERVAL)
+
+        except KeyboardInterrupt:
+            logging.info("🛑 Бот остановлен пользователем")
+            send_telegram_message("🔴 <b>Бот арбитража остановлен</b>")
+            break
+        except Exception as e:
+            logging.error(f"💥 Критическая ошибка: {e}")
+            time.sleep(30)
+
 
 if __name__ == "__main__":
-    main()
-
+    monitor()
