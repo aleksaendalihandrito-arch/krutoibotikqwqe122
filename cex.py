@@ -24,7 +24,6 @@ sent_signals = {}
 
 
 def send_telegram_message(text: str) -> bool:
-    """Отправка сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -42,7 +41,6 @@ def send_telegram_message(text: str) -> bool:
 
 
 def get_all_mexc_usdt_symbols() -> list:
-    """Получение всех USDT пар с MEXC через публичный тикер"""
     url = "https://api.mexc.com/api/v3/ticker/24hr"
     try:
         resp = requests.get(url, timeout=15)
@@ -53,7 +51,6 @@ def get_all_mexc_usdt_symbols() -> list:
         for item in data:
             symbol = item.get('symbol', '')
             if symbol.endswith('USDT'):
-                # Проверяем наличие цены и объёма
                 if float(item.get('quoteVolume', 0)) > 0 and float(item.get('lastPrice', 0)) > 0:
                     symbols.append(symbol)
 
@@ -65,7 +62,6 @@ def get_all_mexc_usdt_symbols() -> list:
 
 
 def get_mexc_ticker(symbol: str) -> Optional[Dict[str, Any]]:
-    """Получение 24-часового тикера с MEXC для конкретной пары"""
     url = "https://api.mexc.com/api/v3/ticker/24hr"
     params = {'symbol': symbol}
     try:
@@ -80,7 +76,7 @@ def get_mexc_ticker(symbol: str) -> Optional[Dict[str, Any]]:
         return {
             'symbol': data['symbol'],
             'lastPrice': float(data['lastPrice']),
-            'volume': float(data['quoteVolume']),  # объём в USDT за 24ч
+            'volume': float(data['quoteVolume']),
             'priceChangePercent': float(data['priceChangePercent'])
         }
     except Exception as e:
@@ -88,10 +84,12 @@ def get_mexc_ticker(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_dexscreener_pair(query: str) -> Optional[Dict[str, Any]]:
+def get_dexscreener_pair(query: str, expected_symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Поиск пары на DexScreener по запросу (символ).
-    Возвращает лучшую пару по ликвидности среди предпочтительных сетей.
+    Поиск пары на DexScreener по запросу (query).
+    Возвращает лучшую пару по ликвидности среди предпочтительных сетей,
+    но только если символ базового токена (baseToken['symbol']) совпадает с expected_symbol
+    (после приведения к верхнему регистру).
     """
     url = "https://api.dexscreener.com/latest/dex/search"
     params = {'q': query}
@@ -105,12 +103,18 @@ def get_dexscreener_pair(query: str) -> Optional[Dict[str, Any]]:
             return None
 
         valid_pairs = []
+        expected_upper = expected_symbol.upper()
+
         for p in data['pairs']:
             chain = p.get('chainId')
             if chain in PREFERRED_CHAINS:
                 try:
+                    base_token_symbol = p.get('baseToken', {}).get('symbol', '')
+                    # Проверяем, что символ базового токена совпадает с ожидаемым (игнорируем регистр)
+                    if base_token_symbol.upper() != expected_upper:
+                        continue
+
                     liquidity = float(p.get('liquidity', {}).get('usd', 0))
-                    # Убрали фильтр по минимальному объёму, оставили только наличие ликвидности
                     if liquidity > 0:
                         valid_pairs.append({
                             'chain': chain,
@@ -130,7 +134,6 @@ def get_dexscreener_pair(query: str) -> Optional[Dict[str, Any]]:
         if not valid_pairs:
             return None
 
-        # Сортируем по ликвидности (убывание) и берём лучшую
         best_pair = max(valid_pairs, key=lambda x: x['liquidityUsd'])
         return best_pair
     except Exception as e:
@@ -139,10 +142,9 @@ def get_dexscreener_pair(query: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_base_currency(mexc_symbol: str) -> str:
-    """Извлекает базовую валюту из пары MEXC"""
     if mexc_symbol.endswith('USDT'):
         base = mexc_symbol[:-4]
-        # Обработка популярных префиксов (1000, etc.)
+        # Убираем популярные префиксы, чтобы получить "чистое" название монеты
         if base.startswith('1000'):
             base = base[4:]
         return base
@@ -150,10 +152,6 @@ def extract_base_currency(mexc_symbol: str) -> str:
 
 
 def check_arbitrage_opportunity(mexc_symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Проверяет возможность арбитража для пары mexc_symbol.
-    Возвращает словарь с данными, если спред >= 1.5% и объём DEX > объёма MEXC.
-    """
     # 1. Данные с MEXC
     mexc_ticker = get_mexc_ticker(mexc_symbol)
     if not mexc_ticker:
@@ -161,25 +159,28 @@ def check_arbitrage_opportunity(mexc_symbol: str) -> Optional[Dict[str, Any]]:
     mexc_price = mexc_ticker['lastPrice']
     mexc_volume = mexc_ticker['volume']
 
-    # 2. Данные с DexScreener
+    # 2. Базовая валюта
     base_currency = extract_base_currency(mexc_symbol)
-    dex_pair = get_dexscreener_pair(base_currency)
+
+    # 3. Поиск на DexScreener с проверкой совпадения символа
+    dex_pair = get_dexscreener_pair(base_currency, base_currency)
     if not dex_pair:
         return None
+
     dex_price = dex_pair['priceUsd']
     dex_volume = dex_pair['volume24h']
 
-    # 3. Условие по объёму: DEX объём должен быть строго больше MEXC объёма
+    # 4. Условие по объёму: DEX объём должен быть строго больше MEXC объёма
     if dex_volume <= mexc_volume:
         return None
 
-    # 4. Расчёт спреда
+    # 5. Расчёт спреда
     spread = (mexc_price - dex_price) / dex_price * 100
     abs_spread = abs(spread)
     if abs_spread < MIN_SPREAD_PERCENT:
         return None
 
-    # 5. Направление
+    # 6. Направление
     if dex_price > mexc_price:
         direction = "LONG (MEXC догонит DEX вверх)"
         action = "Покупка на MEXC"
@@ -189,7 +190,7 @@ def check_arbitrage_opportunity(mexc_symbol: str) -> Optional[Dict[str, Any]]:
         action = "Продажа на MEXC"
         signal_type = "🔴 SHORT"
 
-    # 6. Предотвращение повторов (один сигнал на монету в день)
+    # 7. Предотвращение повторов
     today = datetime.now().strftime('%Y-%m-%d')
     signal_key = f"{base_currency}_{today}_{abs_spread:.1f}"
     if signal_key in sent_signals and time.time() - sent_signals[signal_key] < 86400:
@@ -218,8 +219,6 @@ def check_arbitrage_opportunity(mexc_symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def format_arbitrage_message(data: Dict[str, Any]) -> str:
-    """Форматирует сообщение для Telegram (HTML)"""
-    # Определяем точность отображения цены
     if data['dex_price'] < 0.0001:
         price_precision = 8
     elif data['dex_price'] < 0.01:
@@ -251,7 +250,6 @@ def format_arbitrage_message(data: Dict[str, Any]) -> str:
 
 
 def monitor():
-    """Основной цикл мониторинга"""
     logging.info("🚀 Запуск мониторинга ценовых расхождений DEX / MEXC")
     logging.info(f"⚙️ Параметры: спред от {MIN_SPREAD_PERCENT}%, условие: объём DEX > объём MEXC")
 
@@ -273,7 +271,6 @@ def monitor():
             cycle_count += 1
             now = time.time()
 
-            # Обновляем список монет раз в час
             if now - last_symbols_load > 3600 or not symbols:
                 symbols = get_all_mexc_usdt_symbols()
                 if not symbols:
@@ -299,7 +296,7 @@ def monitor():
                             sent_signals[opportunity['signal_key']] = time.time()
                             logging.info(f"✅ СИГНАЛ #{opportunities_found}: {opportunity['symbol']} "
                                          f"спред {opportunity['abs_spread']:.2f}%")
-                        time.sleep(2)  # пауза между отправками
+                        time.sleep(2)
 
                     if i % 50 == 0:
                         logging.info(f"⏳ Прогресс: {i}/{len(symbols_to_check)}")
@@ -307,7 +304,6 @@ def monitor():
                     logging.error(f"Ошибка при проверке {sym}: {e}")
                     continue
 
-            # Ротация списка
             symbols = symbols[SYMBOLS_PER_CYCLE:] + symbols[:SYMBOLS_PER_CYCLE]
 
             logging.info(f"📊 Цикл #{cycle_count} завершён. Проверено: {len(symbols_to_check)}, "
