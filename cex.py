@@ -11,12 +11,12 @@ TELEGRAM_CHAT_ID = '5296533274'  # ID чата/пользователя
 
 # Параметры арбитража
 MIN_SPREAD_PERCENT = 0.5  # Минимальный спред для сигнала
-MIN_VOLUME_USD = 100000  # Минимальный объем на DEX (в USD) для фильтрации
+MIN_VOLUME_USD = 30000  # Минимальный объем на DEX (в USD) для фильтрации
 CHECK_INTERVAL = 30  # ИНТЕРВАЛ ТЕПЕРЬ 30 СЕКУНД
-MEXC_VOLUME_MULTIPLIER = 0.5  # DEX объем должен быть > MEXC объем * множитель
+MEXC_VOLUME_MULTIPLIER = 0.3  # DEX объем должен быть > MEXC объем * множитель
 
 # НАСТРОЙКА КОЛИЧЕСТВА ПРОВЕРОК
-SYMBOLS_PER_CYCLE = 400  # Сколько монет проверять за один цикл (было 50, стало 200)
+SYMBOLS_PER_CYCLE = 2000  # Сколько монет проверять за один цикл (было 50, стало 200)
 
 # Список сетей для DexScreener (приоритетные)
 PREFERRED_CHAINS = ['ethereum', 'bsc', 'polygon', 'arbitrum', 'optimism', 'avalanche', 'base', 'fantom']
@@ -410,4 +410,5 @@ def monitor():
 
 if __name__ == "__main__":
     monitor()
+
 
